@@ -213,8 +213,13 @@ jobs:
           assets_dir="${minecraft_dir}/assets"
           classpath="$(find "${minecraft_dir}/libraries" -type f -name '*.jar' -print | paste -sd: -):${minecraft_dir}/minecraft_server.1.12.2.jar"
 
-          mkdir -p "${server_dir}/mods"
+          mkdir -p "${server_dir}/mods" "${server_dir}/config"
           find "${instance_dir}/mods" -maxdepth 1 -type f -name '*.jar' -exec cp {} "${server_dir}/mods/" \;
+          printf '%s\n' \
+            '# Runtime tests intentionally omit optional Fugue and Scalar patch mods.' \
+            'general {' \
+            '    B:DISABLE_PATCH_MOD_CHECK=true' \
+            '}' > "${server_dir}/config/forge_early.cfg"
           printf 'eula=true\n' > "${server_dir}/eula.txt"
           printf 'online-mode=false\n' > "${server_dir}/server.properties"
 
@@ -349,6 +354,12 @@ jobs:
           if [ -d "${runtime_root}/minecraft/assets" ]; then
             cp -a "${runtime_root}/minecraft/assets/." "${prism_root}/assets/"
           fi
+          mkdir -p "${game_dir}/config"
+          printf '%s\n' \
+            '# Runtime tests intentionally omit optional Fugue and Scalar patch mods.' \
+            'general {' \
+            '    B:DISABLE_PATCH_MOD_CHECK=true' \
+            '}' > "${game_dir}/config/forge_early.cfg"
 
           test -s "${profile}"
           test -s "${vanilla_jar}"
