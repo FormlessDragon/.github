@@ -1,0 +1,623 @@
+name: Runtime Test
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  JAVA_VERSION: 25
+  CLEANROOM_VERSION: 0.6.10-alpha
+  PRISM_INSTANCE_ID: cleanroom
+  PRISM_PLAYER_NAME: RuntimeTest
+
+jobs:
+  runtime-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Runtime Test Environment
+        uses: actions/cache@v4
+        with:
+          path: |
+            .gradle
+            build/runtime-test/minecraft
+            build/runtime-test/cleanroom-instance-template.zip
+            build/runtime-test/PrismLauncher/libraries
+            build/runtime-test/PrismLauncher/assets
+            build/runtime-test/support
+            build/runtime-test/client-mods
+            build/runtime-test/remapped-mods
+            build/runtime-test/runtime-mcp-remap.marker
+            build/runtime-test/cleanroom-client-installed.marker
+          key: ${{ runner.os }}-java${{ env.JAVA_VERSION }}-gradle9.7-cleanroom${{ env.CLEANROOM_VERSION }}-mmc-client-helper4.5.1-runtime-test-${{ hashFiles('build.gradle', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties', 'gradle/wrapper/gradle-wrapper.jar', 'gradle/scripts/**', '.github/workflows/runtime-test.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-java${{ env.JAVA_VERSION }}-gradle9.7-cleanroom${{ env.CLEANROOM_VERSION }}-mmc-client-helper4.5.1-runtime-test-
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.7.0
+
+      - name: Grant Execute Permission
+        run: chmod +x gradlew
+
+      - name: Set Build Version
+        run: |
+          previous_tag="$(git describe --tags --abbrev=0 --exclude=dev 2>/dev/null || echo 0.0.0)"
+          previous_tag="${previous_tag#v}"
+          short_hash="$(git rev-parse --short HEAD)"
+          echo "MOD_VERSION=${previous_tag}+${short_hash}" >> "$GITHUB_ENV"
+
+      - name: Prepare Runtime Test Support Directory
+        run: mkdir -p build/runtime-test/support
+
+      - name: Download Runtime Test Support Mod
+        if: ${{ hashFiles('build/runtime-test/support/*.jar') == '' }}
+        uses: robinraju/release-downloader@v1.11
+        with:
+          repository: headlesshq/mc-runtime-test
+          tag: "4.5.1"
+          fileName: "mc-runtime-test-1.12.2-*-lexforge-release.jar"
+          out-file-path: build/runtime-test/support
+
+      - name: Build, Stage, and Install Production Runtime
+        timeout-minutes: 35
+        env:
+          GRADLE_OPTS: -Xmx6g -XX:MaxMetaspaceSize=1g
+        run: |
+          set -euo pipefail
+          runtime_root="$PWD/build/runtime-test"
+          gradle_log="${runtime_root}/gradle-runtime.log"
+          diag_dir="${RUNNER_TEMP}/runtime-test-diagnostics"
+          fifo_dir="$(mktemp -d "${RUNNER_TEMP}/runtime-test-gradle.XXXXXX")"
+          fifo="${fifo_dir}/output"
+          mkdir -p "${runtime_root}" "${diag_dir}"
+          mkfifo "${fifo}"
+
+          tee "${gradle_log}" < "${fifo}" &
+          tee_pid=$!
+          setsid ./gradlew --console=plain --build-cache build stageRuntimeTestMods stageRuntimeTestClientMods installRuntimeTestClient -x spotlessCheck --no-daemon --max-workers=1 -Pmod_version="${MOD_VERSION}" > "${fifo}" 2>&1 &
+          gradle_pid=$!
+          gradle_pgid="$(ps -o pgid= -p "${gradle_pid}" | tr -d ' ')"
+          started_at=$SECONDS
+          deadline=$((started_at + 1800))
+
+          cleanup_output() {
+            kill "${tee_pid}" 2>/dev/null || true
+            wait "${tee_pid}" 2>/dev/null || true
+            rm -rf "${fifo_dir}"
+          }
+          trap cleanup_output EXIT
+
+          dump_diagnostics() {
+            local stamp="$1"
+            ps -eo pid=,ppid=,pgid=,sid=,stat=,etime=,args= > "${diag_dir}/${stamp}-ps.txt" || true
+            jcmd -l > "${diag_dir}/${stamp}-jcmd-list.txt" 2>&1 || true
+            while read -r pid; do
+              timeout 30s jcmd "${pid}" Thread.print -l > "${diag_dir}/${stamp}-jcmd-${pid}.txt" 2>&1 || true
+            done < <(jcmd -l 2>/dev/null | awk '/GradleDaemon|gradle-launcher/ {print $1}')
+            tail -n 200 "${gradle_log}" > "${diag_dir}/${stamp}-gradle-tail.txt" || true
+          }
+
+          while kill -0 "${gradle_pid}" 2>/dev/null; do
+            sleep 30
+            if kill -0 "${gradle_pid}" 2>/dev/null; then
+              elapsed=$((SECONDS - started_at))
+              printf '[RuntimeTest] Gradle still running after %ss; latest output follows.\n' "${elapsed}"
+              tail -n 5 "${gradle_log}" || true
+            fi
+            if (( SECONDS >= deadline )); then
+              printf '[RuntimeTest] Gradle timeout after %ss; collecting diagnostics.\n' "$((SECONDS - started_at))"
+              dump_diagnostics timeout
+              kill -TERM -- "-${gradle_pgid}" 2>/dev/null || true
+              for _ in $(seq 1 30); do
+                kill -0 -- "-${gradle_pgid}" 2>/dev/null || break
+                sleep 1
+              done
+              kill -KILL -- "-${gradle_pgid}" 2>/dev/null || true
+              wait "${gradle_pid}" 2>/dev/null || true
+              exit 124
+            fi
+          done
+
+          set +e
+          wait "${gradle_pid}"
+          gradle_status=$?
+          wait "${tee_pid}"
+          set -e
+          exit "${gradle_status}"
+
+      - name: Prepare Cleanroom Server Jar
+        run: |
+          set -euo pipefail
+          runtime_root="$PWD/build/runtime-test"
+          minecraft_dir="${runtime_root}/minecraft"
+          profile="${minecraft_dir}/versions/1.12.2-Cleanroom-${CLEANROOM_VERSION}/1.12.2-Cleanroom-${CLEANROOM_VERSION}.json"
+          server_url="$(python3 - "${profile}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as handle:
+              print(json.load(handle)['downloads']['server']['url'])
+          PY
+          )"
+          server_sha1="$(python3 - "${profile}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as handle:
+              print(json.load(handle)['downloads']['server']['sha1'])
+          PY
+          )"
+          server_jar="${minecraft_dir}/minecraft_server.1.12.2.jar"
+          if [ ! -f "${server_jar}" ] || ! echo "${server_sha1}  ${server_jar}" | sha1sum --check --status; then
+            curl --fail --location --retry 3 --output "${server_jar}" "${server_url}"
+          fi
+          echo "${server_sha1}  ${server_jar}" | sha1sum --check
+
+      - name: Install Virtual Display
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb
+          fi
+
+      - name: Download Cleanroom MMC Instance
+        run: |
+          set -euo pipefail
+          runtime_root="$PWD/build/runtime-test"
+          template="${runtime_root}/cleanroom-instance-template.zip"
+          template_url="https://github.com/CleanroomMC/Cleanroom/releases/download/${CLEANROOM_VERSION}/cleanroom-${CLEANROOM_VERSION}.zip"
+          if [ ! -f "${template}" ]; then
+            curl --fail --location --retry 3 --output "${template}" "${template_url}"
+          fi
+          unzip -tq "${template}"
+          for required_file in \
+            instance.cfg \
+            mmc-pack.json \
+            patches/net.minecraft.json \
+            patches/net.minecraftforge.json \
+            patches/org.lwjgl3.json; do
+            unzip -Z1 "${template}" | grep -Fxq "${required_file}" || {
+              echo "Cleanroom MMC template is missing ${required_file}" >&2
+              exit 1
+            }
+          done
+
+      - name: Launch Cleanroom Production Server
+        run: |
+          set -euo pipefail
+          runtime_root="$PWD/build/runtime-test"
+          minecraft_dir="${runtime_root}/minecraft"
+          instance_dir="${runtime_root}/instance"
+          server_dir="${runtime_root}/server"
+          assets_dir="${minecraft_dir}/assets"
+          classpath="$(find "${minecraft_dir}/libraries" -type f -name '*.jar' -print | paste -sd: -):${minecraft_dir}/minecraft_server.1.12.2.jar"
+
+          mkdir -p "${server_dir}/mods"
+          find "${instance_dir}/mods" -maxdepth 1 -type f -name '*.jar' -exec cp {} "${server_dir}/mods/" \;
+          printf 'eula=true\n' > "${server_dir}/eula.txt"
+          printf 'online-mode=false\n' > "${server_dir}/server.properties"
+
+          (
+            cd "${server_dir}"
+            java -Xmx4g -XX:MaxMetaspaceSize=1g -cp "${classpath}" \
+              net.minecraftforge.fml.relauncher.ServerLaunchWrapper \
+              --version "1.12.2-Cleanroom-${CLEANROOM_VERSION}" \
+              --gameDir "${server_dir}" \
+              --assetsDir "${assets_dir}" \
+              nogui
+          ) > "${server_dir}/runtime-test-server.log" 2>&1 &
+          server_pid=$!
+
+          cleanup() {
+            kill "${server_pid}" 2>/dev/null || true
+            wait "${server_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          deadline=$((SECONDS + 600))
+          while [ "${SECONDS}" -lt "${deadline}" ]; do
+            if ! kill -0 "${server_pid}" 2>/dev/null; then
+              tail -n 200 "${server_dir}/runtime-test-server.log"
+              exit 1
+            fi
+            if grep -E 'Done \(|For help, type "help"' "${server_dir}/runtime-test-server.log" >/dev/null 2>&1; then
+              echo 'Cleanroom server startup detected.'
+              exit 0
+            fi
+            if find "${server_dir}/crash-reports" -maxdepth 1 -type f -name '*.txt' -print -quit 2>/dev/null | grep -q .; then
+              tail -n 200 "${server_dir}/runtime-test-server.log"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          tail -n 200 "${server_dir}/runtime-test-server.log"
+          exit 1
+
+      - name: Prepare Cleanroom Client Assets
+        run: |
+          set -euo pipefail
+          runtime_root="$PWD/build/runtime-test"
+          profile="${runtime_root}/minecraft/versions/1.12.2-Cleanroom-${CLEANROOM_VERSION}/1.12.2-Cleanroom-${CLEANROOM_VERSION}.json"
+          assets_root="${runtime_root}/PrismLauncher/assets"
+          index_dir="${assets_root}/indexes"
+          index_file="${index_dir}/1.12.json"
+          mkdir -p "${index_dir}" "${assets_root}/objects"
+          test -s "${profile}"
+          python3 - "${profile}" "${index_file}" <<'PY'
+          import json
+          import pathlib
+          import sys
+          import urllib.request
+
+          profile, index_file = sys.argv[1:]
+          data = json.loads(pathlib.Path(profile).read_text(encoding='utf-8'))
+          asset = data.get('assetIndex', {})
+          if not asset.get('url'):
+              raise SystemExit('Cleanroom profile has no assetIndex URL')
+          target = pathlib.Path(index_file)
+          if not target.is_file():
+              with urllib.request.urlopen(asset['url']) as response:
+                  target.write_bytes(response.read())
+          if asset.get('sha1'):
+              import hashlib
+              actual = hashlib.sha1(target.read_bytes()).hexdigest()
+              if actual != asset['sha1']:
+                  raise SystemExit('Asset index SHA-1 mismatch: ' + actual)
+          PY
+          python3 - "${index_file}" "${assets_root}" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+          import urllib.request
+          from concurrent.futures import ThreadPoolExecutor
+
+          index_file, assets_root = sys.argv[1:]
+          index = json.loads(pathlib.Path(index_file).read_text(encoding='utf-8'))
+          objects = pathlib.Path(assets_root) / 'objects'
+
+          def download_asset(asset):
+              digest = asset['hash']
+              target = objects / digest[:2] / digest
+              if target.is_file() and hashlib.sha1(target.read_bytes()).hexdigest() == digest:
+                  return
+              target.parent.mkdir(parents=True, exist_ok=True)
+              url = 'https://resources.download.minecraft.net/' + digest[:2] + '/' + digest
+              with urllib.request.urlopen(url, timeout=60) as response:
+                  target.write_bytes(response.read())
+              if hashlib.sha1(target.read_bytes()).hexdigest() != digest:
+                  raise RuntimeError('Asset SHA-1 mismatch: ' + digest)
+
+          with ThreadPoolExecutor(max_workers=16) as executor:
+              futures = [executor.submit(download_asset, asset) for asset in index.get('objects', {}).values()]
+              for future in futures:
+                  future.result()
+          PY
+
+      - name: Launch Cleanroom Production Client
+        run: |
+          set -euo pipefail
+          runtime_root="$PWD/build/runtime-test"
+          prism_root="${runtime_root}/PrismLauncher"
+          instance_dir="${prism_root}/instances/${PRISM_INSTANCE_ID}"
+          game_dir="${instance_dir}/minecraft"
+          profile="${runtime_root}/minecraft/versions/1.12.2-Cleanroom-${CLEANROOM_VERSION}/1.12.2-Cleanroom-${CLEANROOM_VERSION}.json"
+          vanilla_jar="${runtime_root}/minecraft/versions/1.12.2/1.12.2.jar"
+          forge_patch="${instance_dir}/patches/net.minecraftforge.json"
+          runtime_log="${runtime_root}/cleanroom-client.log"
+          natives_dir="${instance_dir}/natives"
+          classpath_file="${runtime_root}/cleanroom-client-classpath.txt"
+          args_file="${runtime_root}/cleanroom-client-args.txt"
+          main_class_file="${runtime_root}/cleanroom-client-main-class.txt"
+
+          rm -rf "${instance_dir}"
+          mkdir -p "${instance_dir}"
+          unzip -q "${runtime_root}/cleanroom-instance-template.zip" -d "${instance_dir}"
+          mkdir -p "${game_dir}/mods" "${natives_dir}" \
+            "${prism_root}/libraries" "${prism_root}/assets" "${prism_root}/logs"
+          find "${runtime_root}/instance/mods" -maxdepth 1 -type f -name '*.jar' \
+            -exec cp {} "${game_dir}/mods/" \;
+          if [ -d "${runtime_root}/client-mods" ]; then
+            find "${runtime_root}/client-mods" -maxdepth 1 -type f -name '*.jar' \
+              -exec cp {} "${game_dir}/mods/" \;
+          fi
+          if [ -d "${runtime_root}/minecraft/libraries" ]; then
+            cp -a "${runtime_root}/minecraft/libraries/." "${prism_root}/libraries/"
+          fi
+          if [ -d "${runtime_root}/minecraft/assets" ]; then
+            cp -a "${runtime_root}/minecraft/assets/." "${prism_root}/assets/"
+          fi
+
+          test -s "${profile}"
+          test -s "${vanilla_jar}"
+          test -s "${forge_patch}"
+          python3 - "${profile}" "${vanilla_jar}" "${prism_root}" "${instance_dir}" "${game_dir}" "${natives_dir}" "${classpath_file}" "${args_file}" "${main_class_file}" "${forge_patch}" "${PRISM_PLAYER_NAME}" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import shutil
+          import sys
+          import urllib.parse
+          import urllib.request
+          import uuid
+          import zipfile
+
+          profile_path, vanilla_jar_path, prism_root, instance_root, game_dir, natives_dir, classpath_path, args_path, main_path, forge_path, player_name = sys.argv[1:]
+          profile = json.loads(pathlib.Path(profile_path).read_text(encoding='utf-8'))
+          forge = json.loads(pathlib.Path(forge_path).read_text(encoding='utf-8'))
+          prism = pathlib.Path(prism_root)
+          instance = pathlib.Path(instance_root)
+          game = pathlib.Path(game_dir)
+          natives = pathlib.Path(natives_dir)
+          library_root = prism / 'libraries'
+
+          def allowed(rules):
+              if not rules:
+                  return True
+              result = False
+              for rule in rules:
+                  os_name = rule.get('os', {}).get('name')
+                  if os_name is None or os_name in ('linux', 'linux-x86_64'):
+                      result = rule.get('action') == 'allow'
+              return result
+
+          def download_path(download):
+              path = download.get('path')
+              if path:
+                  return path
+              url = download.get('url', '')
+              if url:
+                  return urllib.parse.urlparse(url).path.lstrip('/')
+              return None
+
+          def ensure_download(download, target):
+              expected_sha1 = download.get('sha1')
+              if target.is_file() and (not expected_sha1 or hashlib.sha1(target.read_bytes()).hexdigest() == expected_sha1):
+                  return
+              url = download.get('url')
+              if not url:
+                  raise SystemExit('Missing Cleanroom library download URL: ' + str(target))
+              target.parent.mkdir(parents=True, exist_ok=True)
+              temporary = target.with_suffix(target.suffix + '.part')
+              try:
+                  with urllib.request.urlopen(url, timeout=60) as response:
+                      temporary.write_bytes(response.read())
+                  if expected_sha1 and hashlib.sha1(temporary.read_bytes()).hexdigest() != expected_sha1:
+                      raise SystemExit('Cleanroom library SHA-1 mismatch: ' + str(target))
+                  temporary.replace(target)
+              finally:
+                  temporary.unlink(missing_ok=True)
+
+          classpath = []
+          native_jars = []
+          seen = set()
+          seen_natives = set()
+          for library in profile.get('libraries', []):
+              if not allowed(library.get('rules')):
+                  continue
+              library_name = library.get('name', '')
+              name_parts = library_name.split(':')
+              classifier = name_parts[3] if len(name_parts) > 3 else ''
+              if classifier.startswith('natives-') and classifier != 'natives-linux':
+                  continue
+              downloads = library.get('downloads', {})
+              if library.get('natives'):
+                  native_classifier = library['natives'].get('linux')
+                  if not native_classifier:
+                      continue
+                  native_download = downloads.get('classifiers', {}).get(native_classifier)
+                  native_path = download_path(native_download or {})
+                  if not native_path:
+                      raise SystemExit('Missing Linux native metadata: ' + library_name)
+                  native_jar = library_root / native_path
+                  ensure_download(native_download, native_jar)
+                  native_key = str(native_jar.resolve())
+                  if native_key not in seen_natives:
+                      seen_natives.add(native_key)
+                      native_jars.append(native_jar)
+                  continue
+              artifact = downloads.get('artifact', {})
+              artifact_path = download_path(artifact)
+              if not artifact_path:
+                  raise SystemExit('Missing Cleanroom library metadata: ' + library_name)
+              jar = library_root / artifact_path
+              ensure_download(artifact, jar)
+              key = str(jar.resolve())
+              if classifier == 'natives-linux':
+                  if key not in seen:
+                      seen.add(key)
+                      classpath.append(key)
+              elif key not in seen:
+                  seen.add(key)
+                  classpath.append(key)
+
+          vanilla_jar = pathlib.Path(vanilla_jar_path)
+          if not vanilla_jar.is_file():
+              raise SystemExit('Missing Minecraft client JAR: ' + str(vanilla_jar))
+          classpath.append(str(vanilla_jar.resolve()))
+
+          libraries_by_name = {}
+          for library in profile.get('libraries', []):
+              library_name = library.get('name', '')
+              if library_name:
+                  libraries_by_name[library_name] = library
+
+          required_libraries = {
+              'com.cleanroommc:cleanroom': 'net/minecraftforge/fml/common/launcher/FMLTweaker.class',
+              'com.cleanroommc:lwjglxx': None,
+              'top.outlands:foundation': 'top/outlands/foundation/boot/Foundation.class',
+          }
+          for coordinate, required_class in required_libraries.items():
+              matches = []
+              for library_name, library in libraries_by_name.items():
+                  if library_name.startswith(coordinate + ':'):
+                      artifact_path = download_path(library.get('downloads', {}).get('artifact', {}))
+                      if artifact_path:
+                          matches.append(library_root / artifact_path)
+              if len(matches) != 1 or str(matches[0].resolve()) not in seen:
+                  raise SystemExit('Expected exactly one Cleanroom library: ' + coordinate)
+              if required_class:
+                  with zipfile.ZipFile(matches[0]) as archive:
+                      if required_class not in archive.namelist():
+                          raise SystemExit('Missing launch class ' + required_class + ' in ' + str(matches[0]))
+
+          natives.mkdir(parents=True, exist_ok=True)
+          for native_jar in native_jars:
+              with zipfile.ZipFile(native_jar) as archive:
+                  for item in archive.infolist():
+                      if item.is_dir() or item.filename.startswith('META-INF/'):
+                          continue
+                      target = natives / pathlib.PurePosixPath(item.filename)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with archive.open(item) as source, target.open('wb') as output:
+                          shutil.copyfileobj(source, output)
+
+          tweakers = []
+          for tweaker in forge.get('+tweakers', []) + profile.get('tweakers', []):
+              if tweaker not in tweakers:
+                  tweakers.append(tweaker)
+          jvm_args = [str(value) for value in forge.get('+jvmArgs', []) + profile.get('jvmArgs', [])]
+
+          digest = bytearray(hashlib.md5(('OfflinePlayer:' + player_name).encode()).digest())
+          digest[6] = (digest[6] & 0x0f) | 0x30
+          digest[8] = (digest[8] & 0x3f) | 0x80
+          player_uuid = str(uuid.UUID(bytes=bytes(digest))).replace('-', '')
+          variables = {
+              '${auth_player_name}': player_name,
+              '${auth_uuid}': player_uuid,
+              '${auth_access_token}': '0',
+              '${auth_session}': '-',
+              '${user_type}': 'legacy',
+              '${auth_xuid}': '',
+              '${user_properties}': '{}',
+              '${version_name}': profile.get('id', '1.12.2-Cleanroom'),
+              '${game_directory}': str(game.resolve()),
+              '${assets_root}': str((prism / 'assets').resolve()),
+              '${assets_index_name}': profile['assets'],
+              '${version_type}': 'Forge',
+          }
+          arguments = profile['minecraftArguments'].split()
+          existing_tweakers = set()
+          for index in range(len(arguments) - 1):
+              if arguments[index] == '--tweakClass':
+                  existing_tweakers.add(arguments[index + 1])
+          for tweaker in tweakers:
+              if tweaker not in existing_tweakers:
+                  arguments.extend(['--tweakClass', tweaker])
+                  existing_tweakers.add(tweaker)
+          if arguments.count('net.minecraftforge.fml.common.launcher.FMLTweaker') != 1:
+              raise SystemExit('Expected exactly one FMLTweaker argument')
+          for index, argument in enumerate(arguments):
+              for key, value in variables.items():
+                  argument = argument.replace(key, value)
+              arguments[index] = argument
+          pathlib.Path(classpath_path).write_text(':'.join(classpath) + '\n', encoding='utf-8')
+          pathlib.Path(args_path).write_text('\n'.join(arguments) + '\n', encoding='utf-8')
+          pathlib.Path(main_path).write_text(profile['mainClass'] + '\n', encoding='utf-8')
+          pathlib.Path(instance / 'cleanroom-client-jvm-args.txt').write_text('\n'.join(jvm_args) + '\n', encoding='utf-8')
+          print('[RuntimeTest] Resolved', len(classpath), 'classpath entries and', len(native_jars), 'legacy native JARs.')
+          PY
+
+          main_class="$(tr -d '\r\n' < "${main_class_file}")"
+          mapfile -t minecraft_args < "${args_file}"
+          mapfile -t jvm_args < "${instance_dir}/cleanroom-client-jvm-args.txt"
+          classpath="$(tr -d '\r\n' < "${classpath_file}")"
+          test -n "${main_class}"
+          test -n "${classpath}"
+          printf '[RuntimeTest] Launching Cleanroom main class %s\n' "${main_class}" | tee "${runtime_log}"
+          printf '[RuntimeTest] Classpath entries: %s\n' "$(tr ':' '\n' <<< "${classpath}" | wc -l)" | tee -a "${runtime_log}"
+          printf '[RuntimeTest] JVM arguments: %s; Minecraft arguments: %s\n' "${#jvm_args[@]}" "${#minecraft_args[@]}" | tee -a "${runtime_log}"
+          export NO_COLOR=1
+          cd "${game_dir}"
+          timeout --signal=TERM --kill-after=30s 20m \
+            xvfb-run -a "${JAVA_HOME}/bin/java" \
+              "${jvm_args[@]}" \
+              -Djava.library.path="${natives_dir}" \
+              -cp "${classpath}" \
+              "${main_class}" "${minecraft_args[@]}" \
+            2>&1 | tee -a "${runtime_log}"
+
+      - name: Prune Old Runtime Test Caches
+        if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/github-script@v7
+        env:
+          RUNTIME_CACHE_PREFIX: ${{ runner.os }}-java${{ env.JAVA_VERSION }}-gradle9.7-cleanroom${{ env.CLEANROOM_VERSION }}-mmc-client-helper4.5.1-runtime-test-
+          RUNTIME_CACHE_RETENTION: 3
+        with:
+          script: |
+            const prefix = process.env.RUNTIME_CACHE_PREFIX;
+            const retention = Number(process.env.RUNTIME_CACHE_RETENTION);
+            const caches = await github.paginate(
+              github.rest.actions.getActionsCachesForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              }
+            );
+            const runtimeCaches = caches
+              .filter(cache =>
+                cache.ref === 'refs/heads/main' &&
+                cache.key.startsWith(prefix)
+              )
+              .sort((a, b) =>
+                Date.parse(b.last_accessed_at) - Date.parse(a.last_accessed_at)
+              );
+            const staleCaches = runtimeCaches.slice(retention);
+            for (const cache of staleCaches) {
+              core.info(`Deleting stale runtime-test cache ${cache.key} (${cache.id})`);
+              await github.rest.actions.deleteActionsCacheById({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                cache_id: cache.id,
+              });
+            }
+            core.info(
+              `Runtime-test caches: ${runtimeCaches.length}; ` +
+              `retained: ${Math.min(runtimeCaches.length, retention)}; ` +
+              `deleted: ${staleCaches.length}`
+            );
+
+      - name: Upload Runtime Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-test-logs
+          if-no-files-found: ignore
+          path: |
+            build/runtime-test/instance/logs
+            build/runtime-test/instance/crash-reports
+            build/runtime-test/server/runtime-test-server.log
+            build/runtime-test/server/logs
+            build/runtime-test/server/crash-reports
+            build/runtime-test/minecraft/logs
+            build/runtime-test/minecraft/crash-reports
+            build/runtime-test/gradle-runtime.log
+            build/runtime-test/cleanroom-client.log
+            build/runtime-test/PrismLauncher/instances/${{ env.PRISM_INSTANCE_ID }}/minecraft/logs
+            build/runtime-test/PrismLauncher/instances/${{ env.PRISM_INSTANCE_ID }}/minecraft/crash-reports
+            build/runtime-test/cleanroom-client-installed.marker
+            ${{ runner.temp }}/runtime-test-diagnostics
+          retention-days: 7
